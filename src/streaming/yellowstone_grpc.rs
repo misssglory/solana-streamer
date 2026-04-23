@@ -114,12 +114,11 @@ impl YellowstoneGrpc {
         self.reconnection_config = config;
     }
     
-    /// Set callback to be called when reconnection occurs
-    pub fn set_reconnect_callback<F>(&self, callback: F)
+    pub async fn set_reconnect_callback<F>(&self, callback: F)
     where
         F: Fn() + Send + Sync + 'static,
     {
-        let mut cb_guard = self.reconnect_callback.blocking_lock();
+        let mut cb_guard = self.reconnect_callback.lock().await;
         *cb_guard = Some(Arc::new(callback));
     }
 
