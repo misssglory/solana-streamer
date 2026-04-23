@@ -1,3 +1,4 @@
+// src/streaming/yellowstone_grpc.rs
 use crate::common::AnyResult;
 use crate::streaming::common::{
     process_grpc_transaction, MetricsManager, PerformanceMetrics, StreamClientConfig,
@@ -8,14 +9,15 @@ use crate::streaming::event_parser::{Protocol, DexEvent};
 use crate::streaming::grpc::pool::factory;
 use crate::streaming::grpc::{EventPretty, SubscriptionManager};
 use anyhow::anyhow;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
-use log::error;
+use log::{error, info, warn};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccountsFilter, SubscribeRequestPing,
@@ -37,6 +39,26 @@ pub struct AccountFilter {
     pub filters: Vec<SubscribeRequestFilterAccountsFilter>,
 }
 
+/// Reconnection configuration
+#[derive(Debug, Clone)]
+pub struct ReconnectionConfig {
+    pub max_retries: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub backoff_multiplier: f64,
+}
+
+impl Default for ReconnectionConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 10,
+            base_delay_ms: 1000,
+            max_delay_ms: 30000,
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
 pub struct YellowstoneGrpc {
     pub endpoint: String,
     pub x_token: Option<String>,
@@ -49,6 +71,10 @@ pub struct YellowstoneGrpc {
     pub current_request: Arc<tokio::sync::RwLock<Option<SubscribeRequest>>>,
 
     pub event_type_filter: Arc<tokio::sync::RwLock<Option<EventTypeFilter>>>,
+    
+    // New fields for reconnection support
+    pub reconnection_config: ReconnectionConfig,
+    pub reconnect_callback: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 impl YellowstoneGrpc {
@@ -78,7 +104,23 @@ impl YellowstoneGrpc {
             control_tx: Arc::new(tokio::sync::Mutex::new(None)),
             current_request: Arc::new(tokio::sync::RwLock::new(None)),
             event_type_filter: Arc::new(tokio::sync::RwLock::new(None)),
+            reconnection_config: ReconnectionConfig::default(),
+            reconnect_callback: Arc::new(Mutex::new(None)),
         })
+    }
+    
+    /// Set custom reconnection configuration
+    pub fn set_reconnection_config(&mut self, config: ReconnectionConfig) {
+        self.reconnection_config = config;
+    }
+    
+    /// Set callback to be called when reconnection occurs
+    pub fn set_reconnect_callback<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let mut cb_guard = self.reconnect_callback.blocking_lock();
+        *cb_guard = Some(Arc::new(callback));
     }
 
     /// 获取配置
@@ -144,6 +186,41 @@ impl YellowstoneGrpc {
         F: Fn(DexEvent) + Send + Sync + 'static,
     {
         *self.event_type_filter.write().await = event_type_filter.clone();
+        
+        // Store subscription parameters for potential reconnection
+        let protocols_arc = Arc::new(protocols);
+        let bot_wallet_arc = Arc::new(bot_wallet);
+        let transaction_filter_arc = Arc::new(transaction_filter);
+        let account_filter_arc = Arc::new(account_filter);
+        let event_type_filter_arc = Arc::new(event_type_filter);
+        let commitment_arc = Arc::new(commitment);
+        
+        // Create a reconnectable subscription
+        self.subscribe_with_reconnection(
+            protocols_arc,
+            bot_wallet_arc,
+            transaction_filter_arc,
+            account_filter_arc,
+            event_type_filter_arc,
+            commitment_arc,
+            callback,
+        ).await
+    }
+    
+    /// Internal method that handles subscription with automatic reconnection
+    async fn subscribe_with_reconnection<F>(
+        &self,
+        protocols: Arc<Vec<Protocol>>,
+        bot_wallet: Arc<Option<Pubkey>>,
+        transaction_filter: Arc<Vec<TransactionFilter>>,
+        account_filter: Arc<Vec<AccountFilter>>,
+        event_type_filter: Arc<Option<EventTypeFilter>>,
+        commitment: Arc<Option<CommitmentLevel>>,
+        callback: F,
+    ) -> AnyResult<()>
+    where
+        F: Fn(DexEvent) + Send + Sync + 'static,
+    {
         if self
             .active_subscription
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -152,23 +229,129 @@ impl YellowstoneGrpc {
             return Err(anyhow!("Already subscribed. Use update_subscription() to modify filters"));
         }
 
-        let mut metrics_handle = None;
+        let callback = Arc::new(callback);
+        
+        // Spawn a separate task to manage the connection with reconnection logic
+        let self_clone = self.clone();
+        let protocols_clone = protocols.clone();
+        let bot_wallet_clone = bot_wallet.clone();
+        let transaction_filter_clone = transaction_filter.clone();
+        let account_filter_clone = account_filter.clone();
+        let event_type_filter_clone = event_type_filter.clone();
+        let commitment_clone = commitment.clone();
+        let callback_clone = callback.clone();
+        
+        let reconnect_config = self.reconnection_config.clone();
+        let reconnect_callback = self.reconnect_callback.clone();
+        
+        let stream_handle = tokio::spawn(async move {
+            let mut retry_count = 0;
+            let mut is_first_attempt = true;
+            
+            loop {
+                // Check if we should stop
+                if !self_clone.active_subscription.load(Ordering::Acquire) {
+                    info!("Subscription stopping, exiting reconnection loop");
+                    break;
+                }
+                
+                if !is_first_attempt {
+                    // Calculate delay with exponential backoff
+                    let delay_ms = std::cmp::min(
+                        reconnect_config.base_delay_ms * (reconnect_config.backoff_multiplier.powf(retry_count as f64) as u64),
+                        reconnect_config.max_delay_ms,
+                    );
+                    
+                    warn!("Reconnecting in {} ms (attempt {}/{})", 
+                          delay_ms, retry_count + 1, reconnect_config.max_retries);
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    
+                    // Call reconnect callback if set
+                    if let Some(cb) = reconnect_callback.lock().await.as_ref() {
+                        cb();
+                    }
+                }
+                
+                match self_clone.establish_subscription(
+                    protocols_clone.as_ref(),
+                    bot_wallet_clone.as_ref(),
+                    transaction_filter_clone.as_ref(),
+                    account_filter_clone.as_ref(),
+                    event_type_filter_clone.as_ref(),
+                    commitment_clone.as_ref(),
+                    callback_clone.clone(),
+                ).await {
+                    Ok(()) => {
+                        info!("Subscription established successfully");
+                        retry_count = 0;
+                        is_first_attempt = false;
+                        // If we get here, the subscription is running
+                        // We need to wait for it to fail or complete
+                        tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
+                    }
+                    Err(e) => {
+                        error!("Subscription error: {}", e);
+                        retry_count += 1;
+                        
+                        if retry_count > reconnect_config.max_retries {
+                            error!("Max reconnection attempts ({}) exceeded, giving up", 
+                                   reconnect_config.max_retries);
+                            self_clone.active_subscription.store(false, Ordering::Release);
+                            break;
+                        }
+                        
+                        is_first_attempt = false;
+                        continue;
+                    }
+                }
+            }
+        });
+        
+        // Save subscription handle
+        let subscription_handle = SubscriptionHandle::new(stream_handle, None, None);
+        let mut handle_guard = self.subscription_handle.lock().await;
+        *handle_guard = Some(subscription_handle);
+        
+        Ok(())
+    }
+    
+    /// Internal method to establish a single subscription (without reconnection logic)
+    async fn establish_subscription<F>(
+        &self,
+        protocols: &[Protocol],
+        bot_wallet: &Option<Pubkey>,
+        transaction_filter: &[TransactionFilter],
+        account_filter: &[AccountFilter],
+        event_type_filter: &Option<EventTypeFilter>,
+        commitment: &Option<CommitmentLevel>,
+        callback: Arc<F>,
+    ) -> AnyResult<()>
+    where
+        F: Fn(DexEvent) + Send + Sync + 'static,
+    {
         // 启动自动性能监控（如果启用）
         if self.config.enable_metrics {
-            metrics_handle = MetricsManager::global().start_auto_monitoring().await;
+            let _metrics_handle = MetricsManager::global().start_auto_monitoring().await;
+            // metrics_handle will be dropped here, which is fine
         }
+
+        // Convert references to owned data for the spawned task
+        let protocols_owned = protocols.to_vec();
+        let bot_wallet_owned = *bot_wallet;
+        let event_type_filter_owned = event_type_filter.clone();
+        let callback_clone = callback.clone();
 
         let transactions = self
             .subscription_manager
-            .get_subscribe_request_filter(transaction_filter, event_type_filter.as_ref());
+            .get_subscribe_request_filter(transaction_filter.to_vec(), event_type_filter.as_ref());
         let accounts = self
             .subscription_manager
-            .subscribe_with_account_request(account_filter, event_type_filter.as_ref());
+            .subscribe_with_account_request(account_filter.to_vec(), event_type_filter.as_ref());
 
         // 订阅事件
         let (subscribe_tx, mut stream, subscribe_request) = self
             .subscription_manager
-            .subscribe_with_request(transactions, accounts, commitment, event_type_filter.as_ref())
+            .subscribe_with_request(transactions, accounts, *commitment, event_type_filter.as_ref())
             .await?;
 
         // 用 Arc<Mutex<>> 包装 subscribe_tx 以支持多线程共享
@@ -177,12 +360,23 @@ impl YellowstoneGrpc {
         let (control_tx, mut control_rx) = mpsc::channel(100);
         *self.control_tx.lock().await = Some(control_tx);
 
-        // Wrap callback once before the async block
-        let callback = Arc::new(callback);
-
-        let stream_handle = tokio::spawn(async move {
+        let stream_processing: tokio::task::JoinHandle<AnyResult<()>> = tokio::spawn(async move {
+            let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+            
             loop {
                 tokio::select! {
+                    // Send periodic pings to keep connection alive
+                    _ = ping_interval.tick() => {
+                        if let Ok(mut tx_guard) = subscribe_tx.try_lock() {
+                            let _ = tx_guard
+                                .send(SubscribeRequest {
+                                    ping: Some(SubscribeRequestPing { id: 1 }),
+                                    ..Default::default()
+                                })
+                                .await;
+                        }
+                    }
+                    
                     message = stream.next() => {
                         match message {
                             Some(Ok(msg)) => {
@@ -193,10 +387,10 @@ impl YellowstoneGrpc {
                                         log::debug!("Received account: {:?}", account_pretty);
                                         if let Err(e) = process_grpc_transaction(
                                             EventPretty::Account(account_pretty),
-                                            &protocols,
-                                            event_type_filter.as_ref(),
-                                            callback.clone(),
-                                            bot_wallet,
+                                            &protocols_owned,
+                                            event_type_filter_owned.as_ref(),
+                                            callback_clone.clone(),
+                                            bot_wallet_owned,
                                         )
                                         .await
                                         {
@@ -208,10 +402,10 @@ impl YellowstoneGrpc {
                                         log::debug!("Received block meta: {:?}", block_meta_pretty);
                                         if let Err(e) = process_grpc_transaction(
                                             EventPretty::BlockMeta(block_meta_pretty),
-                                            &protocols,
-                                            event_type_filter.as_ref(),
-                                            callback.clone(),
-                                            bot_wallet,
+                                            &protocols_owned,
+                                            event_type_filter_owned.as_ref(),
+                                            callback_clone.clone(),
+                                            bot_wallet_owned,
                                         )
                                         .await
                                         {
@@ -220,17 +414,17 @@ impl YellowstoneGrpc {
                                     }
                                     Some(UpdateOneof::Transaction(sut)) => {
                                         let transaction_pretty = factory::create_transaction_pretty_pooled(sut, created_at);
-                                        log::debug!(
+                                        log::trace!(
                                             "Received transaction: {} at slot {}",
                                             transaction_pretty.signature,
                                             transaction_pretty.slot
                                         );
                                         if let Err(e) = process_grpc_transaction(
                                             EventPretty::Transaction(transaction_pretty),
-                                            &protocols,
-                                            event_type_filter.as_ref(),
-                                            callback.clone(),
-                                            bot_wallet,
+                                            &protocols_owned,
+                                            event_type_filter_owned.as_ref(),
+                                            callback_clone.clone(),
+                                            bot_wallet_owned,
                                         )
                                         .await
                                         {
@@ -238,7 +432,7 @@ impl YellowstoneGrpc {
                                         }
                                     }
                                     Some(UpdateOneof::Ping(_)) => {
-                                        // 只在需要时获取锁，并立即释放
+                                        // Respond to ping
                                         if let Ok(mut tx_guard) = subscribe_tx.try_lock() {
                                             let _ = tx_guard
                                                 .send(SubscribeRequest {
@@ -261,26 +455,38 @@ impl YellowstoneGrpc {
                             }
                             Some(Err(error)) => {
                                 error!("Stream error: {error:?}");
-                                break;
+                                // Return error to trigger reconnection
+                                return Err(anyhow::anyhow!("Stream error: {error:?}"));
                             }
-                            None => break,
+                            None => {
+                                warn!("Stream ended unexpectedly");
+                                return Err(anyhow::anyhow!("Stream ended unexpectedly"));
+                            }
                         }
                     }
                     Some(update) = control_rx.next() => {
                         if let Err(e) = subscribe_tx.lock().await.send(update).await {
                             error!("Failed to send subscription update: {}", e);
-                            break;
+                            return Err(anyhow::anyhow!("Failed to send subscription update: {}", e));
                         }
                     }
                 }
             }
         });
-
-        // 保存订阅句柄
-        let subscription_handle = SubscriptionHandle::new(stream_handle, None, metrics_handle);
-        let mut handle_guard = self.subscription_handle.lock().await;
-        *handle_guard = Some(subscription_handle);
-
+        
+        // Wait for stream processing to complete or error
+        match stream_processing.await {
+            Ok(result) => {
+                if let Err(e) = result {
+                    return Err(e);
+                }
+            }
+            Err(e) => {
+                error!("Stream processing task panicked: {}", e);
+                return Err(anyhow::anyhow!("Stream processing task panicked: {}", e));
+            }
+        }
+        
         Ok(())
     }
 
@@ -353,11 +559,13 @@ impl Clone for YellowstoneGrpc {
             x_token: self.x_token.clone(),
             config: self.config.clone(),
             subscription_manager: self.subscription_manager.clone(),
-            subscription_handle: self.subscription_handle.clone(), // 共享同一个 Arc<Mutex<>>
+            subscription_handle: self.subscription_handle.clone(),
             active_subscription: self.active_subscription.clone(),
             control_tx: self.control_tx.clone(),
             event_type_filter: self.event_type_filter.clone(),
             current_request: self.current_request.clone(),
+            reconnection_config: self.reconnection_config.clone(),
+            reconnect_callback: self.reconnect_callback.clone(),
         }
     }
 }

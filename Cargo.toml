@@ -39,5 +39,14 @@ spl-token-2022 = { version = "10.0.0", default-features = false, features = ["no
 # spl-token-2022 10.0.0 is incompatible with spl-token-group-interface 0.7.2+ (E0308).
 # Keep token-group-interface pinned to 0.7.1 until the upstream token-2022 bump is available.
 spl-token-group-interface = "=0.7.1"
-solana-commitment-config = { version = "3.1.1", features = ["serde"] }
 tonic-prost = "0.14.5"
+solana-commitment-config = { version = "3.1.1", features = ["serde"] }
+tracing-subscriber = "0.3.22"
+bs58 = "0.5.1"
+
+[profile.release]
+opt-level = 3
+lto = true        # Link Time Optimization for smaller/faster binary.
+codegen-units = 1 # Slower compilation, better optimization.
+panic = "abort"   # Reduces binary size (no unwinding).
+strip = "symbols"
